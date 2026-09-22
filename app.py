@@ -115,6 +115,9 @@ def post_status():
             "status": status,
             "last_updated": received_at,
             "last_changed": received_at if status_changed else existing.get("last_changed", received_at),
+            # "notified" is False whenever there's a status change Power Automate
+            # hasn't posted to Teams yet. Heartbeats (no change) don't touch it.
+            "notified": False if status_changed else existing.get("notified", True),
         }
         vm_state[vm_name] = entry
 
@@ -130,28 +133,48 @@ def get_status():
 
 @app.route("/status/changes", methods=["GET"])
 def get_status_changes():
-    since_raw = request.args.get("since")
-    since_dt = parse_iso(since_raw) if since_raw else None
-
-    if since_raw and since_dt is None:
-        return jsonify({"error": "invalid 'since' timestamp, expected ISO8601"}), 400
-
+    """Returns VMs whose status change hasn't been acknowledged yet
+    (see POST /status/ack). This is what Power Automate should poll -
+    no need to track a 'since' cursor between runs."""
     with state_lock:
         snapshot = list(vm_state.values())
 
-    if since_dt is None:
-        changed = snapshot
-    else:
-        changed = [
-            entry for entry in snapshot
-            if parse_iso(entry["last_changed"]) and parse_iso(entry["last_changed"]) > since_dt
-        ]
+    changed = [entry for entry in snapshot if not entry.get("notified", True)]
 
     return jsonify({
         "count": len(changed),
         "checked_at": now_iso(),
         "vms": changed,
     }), 200
+
+
+@app.route("/status/ack", methods=["POST"])
+def ack_status_changes():
+    """Marks the given VMs' current status as acknowledged/notified, so they
+    stop showing up in /status/changes. Call this right after successfully
+    posting to Teams.
+
+    Body: {"vm_names": ["VM01", "VM02"]}  or  {"ack_all": true}
+    """
+    data = request.get_json(silent=True) or {}
+    ack_all = data.get("ack_all", False)
+    vm_names = data.get("vm_names", [])
+
+    acked = []
+    with state_lock:
+        if ack_all:
+            for name, entry in vm_state.items():
+                if not entry.get("notified", True):
+                    entry["notified"] = True
+                    acked.append(name)
+        else:
+            for name in vm_names:
+                entry = vm_state.get(name)
+                if entry is not None and not entry.get("notified", True):
+                    entry["notified"] = True
+                    acked.append(name)
+
+    return jsonify({"ok": True, "acknowledged": acked}), 200
 
 
 @app.route("/status/<vm_name>", methods=["GET"])
